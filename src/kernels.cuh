@@ -103,6 +103,14 @@ static_assert(E_DIM / 2 <= MAX_NUM_THREAD,
               "rmsNorm, embeddingGather and residualAdd launch E_DIM/2 threads");
 static_assert(KV_DIM <= MAX_NUM_THREAD,
               "kvCacheScatter launches one thread per K or V column");
+static_assert(FA_BR % 16 == 0 && FA_BC % 16 == 0 && HEAD_DIM % 16 == 0,
+              "flashAttentionPrefillWmma tiles both matmuls with 16x16x16 fragments");
+static_assert((FA_BR/16)*(FA_BC/16) <= FA_THREADS/32 &&
+              (FA_BR/16)*(HEAD_DIM/16) <= FA_THREADS/32,
+              "flashAttentionPrefillWmma gives one output tile to each warp");
+static_assert(HEAD_DIM % 8 == 0 && FA_BC % 8 == 0 && HEAD_DIM % 4 == 0 && FA_BC % 4 == 0,
+              "wmma load_matrix_sync needs a 16 byte aligned leading dimension, which is "
+              "8 elements for bf16 and 4 for the float accumulators");
 static_assert(INTERMEDIATE_DIM % MAX_NUM_THREAD == 0,
               "siluKernel strides by MAX_NUM_THREAD up to INTERMEDIATE_DIM");
 static_assert(DEFAULT_TOP_K >= 1 && DEFAULT_TOP_K <= MAX_TOP_K,
@@ -129,6 +137,8 @@ void rope(bf16* input, int num_tokens, int proj_dim);
 void causalMask(bf16* input, int num_tokens);
 void flashAttentionPrefill(const bf16* q, const bf16* k, const bf16* v,
                            bf16* out, int num_tokens);
+void flashAttentionPrefillWmma(const bf16* q, const bf16* k, const bf16* v,
+                               bf16* out, int num_tokens);
 
 // decode
 void decodeSoftmax(bf16* attention_scores, const int* positions, int num_rows, int max_len);

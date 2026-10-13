@@ -9,3 +9,6 @@ test.sh
 /eval/__pycache__
 /nob
 prompts.txt
+profile.nsys-rep
+profile.DiagnosticsSummary.html
+profile.AnalysisSummary.html

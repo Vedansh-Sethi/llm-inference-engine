@@ -1,6 +1,7 @@
 #include "kernels.cuh"
 #include <algorithm>
 #include <iostream>
+#include <mma.h>
 #include <vector>
 
 __global__ void embeddingGatherKernel(int* gpu_input_tokens, bf16* gpu_input_embeds, bf16* embed_tokens, int num_input_tokens) {
@@ -263,6 +264,146 @@ void flashAttentionPrefill(const bf16* q, const bf16* k, const bf16* v,
   cudaError error = cudaGetLastError();
   if(error != cudaError::cudaSuccess) {
     std::cerr << "CUDA last error in flashAttentionPrefill: " << cudaGetErrorString(error) << std::endl;
+  }
+}
+
+__global__ void flashAttentionPrefillWmmaKernel(const bf16* __restrict__ q,
+                                                const bf16* __restrict__ k,
+                                                const bf16* __restrict__ v,
+                                                bf16* __restrict__ out,
+                                                int num_tokens, float scale) {
+  using namespace nvcuda;
+
+  __shared__ bf16  Qs[FA_BR][HEAD_DIM];
+  __shared__ bf16  Ks[FA_BC][HEAD_DIM];
+  __shared__ bf16  Vs[FA_BC][HEAD_DIM];
+  __shared__ float Ss[FA_BR][FA_BC];
+  __shared__ bf16  Ps[FA_BR][FA_BC];
+  __shared__ float Os[FA_BR][HEAD_DIM];
+  __shared__ float ms[FA_BR];
+  __shared__ float ds[FA_BR];
+  __shared__ float as[FA_BR];
+
+  const int q0     = blockIdx.x*FA_BR;
+  const int q_head = blockIdx.y;
+  const int k_head = q_head / GQA_Q_TO_K_RATIO;
+
+  const int tx  = threadIdx.x;
+  const int ty  = threadIdx.y;
+  const int tid = ty*32 + tx;
+
+  const bf16* q_base = q + (size_t)q0*E_DIM + q_head*HEAD_DIM;
+  const bf16* k_base = k + k_head*HEAD_DIM;
+  const bf16* v_base = v + k_head*HEAD_DIM;
+
+  for(int e=tid; e<FA_BR*HEAD_DIM; e+=FA_THREADS) {
+    int i = e/HEAD_DIM, c = e%HEAD_DIM;
+    Qs[i][c] = (q0+i < num_tokens) ? q_base[(size_t)i*E_DIM + c] : (bf16)0.0f;
+    Os[i][c] = 0.0f;
+  }
+  if(tid < FA_BR) {
+    ms[tid] = -INF;
+    ds[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  const int kv_end = (q0 + FA_BR < num_tokens) ? q0 + FA_BR : num_tokens;
+
+  for(int kv0=0; kv0<kv_end; kv0+=FA_BC) {
+    for(int e=tid; e<FA_BC*HEAD_DIM; e+=FA_THREADS) {
+      int j = e/HEAD_DIM, c = e%HEAD_DIM;
+      bool live = (kv0+j) < num_tokens;
+      Ks[j][c] = live ? k_base[(size_t)(kv0+j)*KV_DIM + c] : (bf16)0.0f;
+      Vs[j][c] = live ? v_base[(size_t)(kv0+j)*KV_DIM + c] : (bf16)0.0f;
+    }
+    __syncthreads();
+
+    if(ty < (FA_BR/16)*(FA_BC/16)) {
+      int i_tile = ty / (FA_BC/16);
+      int j_tile = ty % (FA_BC/16);
+
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+      wmma::fill_fragment(acc, 0.0f);
+
+      for(int kt=0; kt<HEAD_DIM/16; kt++) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::col_major> b;
+        wmma::load_matrix_sync(a, &Qs[i_tile*16][kt*16], HEAD_DIM);
+        wmma::load_matrix_sync(b, &Ks[j_tile*16][kt*16], HEAD_DIM);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(&Ss[i_tile*16][j_tile*16], acc, FA_BC, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    for(int i=ty; i<FA_BR; i+=FA_THREADS/32) {
+      int q_pos = q0 + i, k_pos = kv0 + tx;
+      float s = (q_pos < num_tokens && k_pos <= q_pos) ? Ss[i][tx]*scale : -INF;
+
+      float tile_max = s;
+      for(int off=16; off>0; off>>=1) tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, off));
+
+      float m_old = ms[i];
+      float m_new = fmaxf(m_old, tile_max);
+      float p = (m_new == -INF) ? 0.0f : expf(s - m_new);
+      Ps[i][tx] = (bf16)p;
+
+      float tile_sum = p;
+      for(int off=16; off>0; off>>=1) tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, off);
+
+      if(tx == 0) {
+        float alpha = (m_new == -INF) ? 1.0f : expf(m_old - m_new);
+        as[i] = alpha;
+        ds[i] = ds[i]*alpha + tile_sum;
+        ms[i] = m_new;
+      }
+    }
+    __syncthreads();
+
+    for(int e=tid; e<FA_BR*HEAD_DIM; e+=FA_THREADS) {
+      int i = e/HEAD_DIM, c = e%HEAD_DIM;
+      Os[i][c] *= as[i];
+    }
+    __syncthreads();
+
+    {
+      int i_tile = ty / (HEAD_DIM/16);
+      int c_tile = ty % (HEAD_DIM/16);
+
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+      wmma::load_matrix_sync(acc, &Os[i_tile*16][c_tile*16], HEAD_DIM, wmma::mem_row_major);
+
+      for(int jt=0; jt<FA_BC/16; jt++) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::row_major> b;
+        wmma::load_matrix_sync(a, &Ps[i_tile*16][jt*16], FA_BC);
+        wmma::load_matrix_sync(b, &Vs[jt*16][c_tile*16], HEAD_DIM);
+        wmma::mma_sync(acc, a, b, acc);
+      }
+      wmma::store_matrix_sync(&Os[i_tile*16][c_tile*16], acc, HEAD_DIM, wmma::mem_row_major);
+    }
+    __syncthreads();
+  }
+
+  bf16* o_base = out + (size_t)q0*E_DIM + q_head*HEAD_DIM;
+  for(int e=tid; e<FA_BR*HEAD_DIM; e+=FA_THREADS) {
+    int i = e/HEAD_DIM, c = e%HEAD_DIM;
+    if(q0+i >= num_tokens) continue;
+    o_base[(size_t)i*E_DIM + c] = (bf16)(Os[i][c] / ds[i]);
+  }
+}
+
+void flashAttentionPrefillWmma(const bf16* q, const bf16* k, const bf16* v,
+                               bf16* out, int num_tokens) {
+  if(num_tokens < 1) return;
+
+  dim3 grid((num_tokens + FA_BR - 1)/FA_BR, NUM_Q_HEADS);
+  dim3 block(32, FA_THREADS/32);
+  flashAttentionPrefillWmmaKernel<<<grid, block>>>(q, k, v, out, num_tokens, 1.0f/SQRT_HEAD_DIM);
+
+  cudaError error = cudaGetLastError();
+  if(error != cudaError::cudaSuccess) {
+    std::cerr << "CUDA last error in flashAttentionPrefillWmma: " << cudaGetErrorString(error) << std::endl;
   }
 }
 

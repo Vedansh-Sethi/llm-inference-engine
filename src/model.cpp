@@ -99,7 +99,7 @@ void forwardPrefill(const std::vector<int>& prompt, int prompt_len, int slot,
     cudaMemcpy(layerK(slot_cache, layer), k_proj, prompt_len*KV_DIM*sizeof(bf16), cudaMemcpyDeviceToDevice);
     cudaMemcpy(layerV(slot_cache, layer), v_proj, prompt_len*KV_DIM*sizeof(bf16), cudaMemcpyDeviceToDevice);
 
-    flashAttentionPrefill(q_proj, k_proj, v_proj, attn_out, prompt_len);
+    flashAttentionPrefillWmma(q_proj, k_proj, v_proj, attn_out, prompt_len);
 
     linear(cublas_handle, attn_out, weights.w_o[layer], o_proj, prompt_len, E_DIM, E_DIM);
     residualAdd(o_proj, hidden_state, prompt_len);
