@@ -96,9 +96,6 @@ static_assert(MAX_PROMPT_LEN <= MAX_NUM_THREAD,
               "softmax and causalMask launch one thread per prompt position");
 static_assert(MAX_PROMPT_LEN <= MAX_SEQ_LEN,
               "a prompt has to fit in the KV cache");
-static_assert((size_t)MAX_PROMPT_LEN * MAX_PROMPT_LEN >= (size_t)MAX_SEQUENCES * MAX_SEQ_LEN,
-              "attn_scores is sized for prefill but decode needs "
-              "MAX_SEQUENCES * NUM_Q_HEADS * MAX_SEQ_LEN");
 static_assert(E_DIM / 2 <= MAX_NUM_THREAD,
               "rmsNorm, embeddingGather and residualAdd launch E_DIM/2 threads");
 static_assert(KV_DIM <= MAX_NUM_THREAD,

@@ -212,7 +212,7 @@ int Buffers::allocate(bool score_mode) {
   cudaMalloc(&q_proj,      (size_t)MAX_PROMPT_LEN * E_DIM * sizeof(bf16));
   cudaMalloc(&k_proj,      (size_t)MAX_PROMPT_LEN * KV_DIM * sizeof(bf16));
   cudaMalloc(&v_proj,      (size_t)MAX_PROMPT_LEN * KV_DIM * sizeof(bf16));
-  cudaMalloc(&attn_scores, (size_t)NUM_Q_HEADS * MAX_PROMPT_LEN * MAX_PROMPT_LEN * sizeof(bf16));
+  cudaMalloc(&attn_scores, (size_t)MAX_SEQUENCES * NUM_Q_HEADS * MAX_SEQ_LEN * sizeof(bf16));
   cudaMalloc(&attn_out,    (size_t)MAX_PROMPT_LEN * E_DIM * sizeof(bf16));
   cudaMalloc(&o_proj,      (size_t)MAX_PROMPT_LEN * E_DIM * sizeof(bf16));
 
