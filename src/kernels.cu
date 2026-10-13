@@ -399,6 +399,8 @@ __global__ void decodeSoftmaxKernel(bf16* attention_scores, const int* positions
 
   if(threadIdx.x < seq_len) {
     attention_scores[workIdx] = (bf16)(expf(token - m[0]) / d[0]);
+  } else {
+    attention_scores[workIdx] = (bf16)0.0f;
   }
 }
 

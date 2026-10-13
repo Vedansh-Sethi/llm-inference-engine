@@ -63,6 +63,12 @@ struct Buffers {
   bf16* attn_out = nullptr;             // scores @ V
   bf16* o_proj = nullptr;               // after w_o
 
+  void** gpu_k_ptrs = nullptr;
+  void** gpu_v_ptrs = nullptr;
+  void** gpu_q_ptrs = nullptr;
+  void** gpu_s_ptrs = nullptr;
+  void** gpu_o_ptrs = nullptr;
+
   bf16* gate = nullptr;
   bf16* up = nullptr;
   bf16* down = nullptr;

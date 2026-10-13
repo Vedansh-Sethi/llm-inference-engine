@@ -151,6 +151,11 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
   int* gpu_input_tokens = buf.gpu_input_tokens;
   int* gpu_positions = buf.gpu_positions;
   int* gpu_slots = buf.gpu_slots;
+  void** gpu_k_ptrs = buf.gpu_k_ptrs;
+  void** gpu_v_ptrs = buf.gpu_v_ptrs;
+  void** gpu_q_ptrs = buf.gpu_q_ptrs;
+  void** gpu_s_ptrs = buf.gpu_s_ptrs;
+  void** gpu_o_ptrs = buf.gpu_o_ptrs;
   bf16* hidden_state = buf.hidden_state;
   bf16* rms_norms = buf.rms_norms;
   bf16* q_proj = buf.q_proj;
@@ -187,6 +192,36 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
   cudaMemcpy(gpu_slots, active.data(), B*sizeof(int), cudaMemcpyHostToDevice);
   embeddingGather(gpu_input_tokens, hidden_state, weights.embed_tokens, B);
 
+  int batch_ptrs = B*NUM_K_HEADS;
+  std::vector<void*> h_q(batch_ptrs), h_s(batch_ptrs), h_o(batch_ptrs);
+  std::vector<void*> h_k((size_t)N_LAYERS*batch_ptrs), h_v((size_t)N_LAYERS*batch_ptrs);
+
+  for(int b=0; b<B; b++) {
+    for(int g=0; g<NUM_K_HEADS; g++) {
+      int i = b*NUM_K_HEADS + g;
+      h_q[i] = q_proj      + (size_t)b*E_DIM + (size_t)g*GQA_Q_TO_K_RATIO*HEAD_DIM;
+      h_s[i] = attn_scores + (size_t)b*NUM_Q_HEADS*MAX_SEQ_LEN + (size_t)g*GQA_Q_TO_K_RATIO*MAX_SEQ_LEN;
+      h_o[i] = attn_out    + (size_t)b*E_DIM + (size_t)g*GQA_Q_TO_K_RATIO*HEAD_DIM;
+    }
+  }
+
+  for(int layer=0; layer<N_LAYERS; layer++) {
+    for(int b=0; b<B; b++) {
+      bf16* sc = slotCache(kv_cache, active[b]);
+      for(int g=0; g<NUM_K_HEADS; g++) {
+        size_t i = (size_t)layer*batch_ptrs + b*NUM_K_HEADS + g;
+        h_k[i] = layerK(sc, layer) + (size_t)g*HEAD_DIM;
+        h_v[i] = layerV(sc, layer) + (size_t)g*HEAD_DIM;
+      }
+    }
+  }
+
+  cudaMemcpy(gpu_q_ptrs, h_q.data(), batch_ptrs*sizeof(void*), cudaMemcpyHostToDevice);
+  cudaMemcpy(gpu_s_ptrs, h_s.data(), batch_ptrs*sizeof(void*), cudaMemcpyHostToDevice);
+  cudaMemcpy(gpu_o_ptrs, h_o.data(), batch_ptrs*sizeof(void*), cudaMemcpyHostToDevice);
+  cudaMemcpy(gpu_k_ptrs, h_k.data(), h_k.size()*sizeof(void*), cudaMemcpyHostToDevice);
+  cudaMemcpy(gpu_v_ptrs, h_v.data(), h_v.size()*sizeof(void*), cudaMemcpyHostToDevice);
+
   for(int layer=0; layer<N_LAYERS; layer++) {
     rmsNorm(hidden_state, rms_norms, weights.input_layernorm[layer], B);
 
@@ -199,39 +234,30 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
 
     kvCacheScatter(kv_cache, k_proj, v_proj, gpu_slots, gpu_positions, B, layer);
 
-    for(int b=0; b<B; b++) {
-      int len = batch_positions[b] + 1;
-      bf16* Sc = slotCache(kv_cache, active[b]);
-      bf16* Sb = attn_scores + (size_t)b*NUM_Q_HEADS*MAX_SEQ_LEN;
+    void** k_ptrs = gpu_k_ptrs + (size_t)layer*batch_ptrs;
+    void** v_ptrs = gpu_v_ptrs + (size_t)layer*batch_ptrs;
 
-      cublasGemmStridedBatchedEx(
-          cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
-          len, GQA_Q_TO_K_RATIO, HEAD_DIM,
-          &scale,
-          layerK(Sc, layer),            CUDA_R_16BF, KV_DIM,      (long long)HEAD_DIM,
-          q_proj + (size_t)b*E_DIM,     CUDA_R_16BF, HEAD_DIM,    (long long)GQA_Q_TO_K_RATIO*HEAD_DIM,
-          &zero,
-          Sb,                           CUDA_R_16BF, MAX_SEQ_LEN, (long long)GQA_Q_TO_K_RATIO*MAX_SEQ_LEN,
-          NUM_K_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    }
+    cublasGemmBatchedEx(
+        cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+        max_len, GQA_Q_TO_K_RATIO, HEAD_DIM,
+        &scale,
+        (const void* const*)k_ptrs,     CUDA_R_16BF, KV_DIM,
+        (const void* const*)gpu_q_ptrs, CUDA_R_16BF, HEAD_DIM,
+        &zero,
+        (void* const*)gpu_s_ptrs,       CUDA_R_16BF, MAX_SEQ_LEN,
+        batch_ptrs, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
     decodeSoftmax(attn_scores, gpu_positions, B, max_len);
 
-    for(int b=0; b<B; b++) {
-      int len = batch_positions[b] + 1;
-      bf16* Sc = slotCache(kv_cache, active[b]);
-      bf16* Sb = attn_scores + (size_t)b*NUM_Q_HEADS*MAX_SEQ_LEN;
-
-      cublasGemmStridedBatchedEx(
-          cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-          HEAD_DIM, GQA_Q_TO_K_RATIO, len,
-          &one,
-          layerV(Sc, layer),            CUDA_R_16BF, KV_DIM,      (long long)HEAD_DIM,
-          Sb,                           CUDA_R_16BF, MAX_SEQ_LEN, (long long)GQA_Q_TO_K_RATIO*MAX_SEQ_LEN,
-          &zero,
-          attn_out + (size_t)b*E_DIM,   CUDA_R_16BF, HEAD_DIM,    (long long)GQA_Q_TO_K_RATIO*HEAD_DIM,
-          NUM_K_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-    }
+    cublasGemmBatchedEx(
+        cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        HEAD_DIM, GQA_Q_TO_K_RATIO, max_len,
+        &one,
+        (const void* const*)v_ptrs,     CUDA_R_16BF, KV_DIM,
+        (const void* const*)gpu_s_ptrs, CUDA_R_16BF, MAX_SEQ_LEN,
+        &zero,
+        (void* const*)gpu_o_ptrs,       CUDA_R_16BF, HEAD_DIM,
+        batch_ptrs, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
     linear(cublas_handle, attn_out, weights.w_o[layer], o_proj, B, E_DIM, E_DIM);
     residualAdd(o_proj, hidden_state, B);
