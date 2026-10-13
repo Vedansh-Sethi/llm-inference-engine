@@ -52,6 +52,7 @@ struct Buffers {
 
   int* gpu_input_tokens = nullptr;
   int* gpu_positions = nullptr;         // MAX_SEQUENCES, cache position of each row
+  int* gpu_slots = nullptr;
   bf16* hidden_state = nullptr;         // carried across all N_LAYERS
   bf16* rms_norms = nullptr;            // rmsNorm output, never in place
 

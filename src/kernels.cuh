@@ -101,6 +101,8 @@ static_assert((size_t)MAX_PROMPT_LEN * MAX_PROMPT_LEN >= (size_t)MAX_SEQUENCES *
               "MAX_SEQUENCES * NUM_Q_HEADS * MAX_SEQ_LEN");
 static_assert(E_DIM / 2 <= MAX_NUM_THREAD,
               "rmsNorm, embeddingGather and residualAdd launch E_DIM/2 threads");
+static_assert(KV_DIM <= MAX_NUM_THREAD,
+              "kvCacheScatter launches one thread per K or V column");
 static_assert(INTERMEDIATE_DIM % MAX_NUM_THREAD == 0,
               "siluKernel strides by MAX_NUM_THREAD up to INTERMEDIATE_DIM");
 static_assert(DEFAULT_TOP_K >= 1 && DEFAULT_TOP_K <= MAX_TOP_K,
@@ -129,8 +131,10 @@ void flashAttentionPrefill(const bf16* q, const bf16* k, const bf16* v,
                            bf16* out, int num_tokens);
 
 // decode
-void decodeSoftmax(bf16* attention_scores, int seq_len);
+void decodeSoftmax(bf16* attention_scores, const int* positions, int num_rows, int max_len);
 void ropeDecode(bf16* input, const int* positions, int num_rows, int proj_dim);
+void kvCacheScatter(bf16* kv_cache, const bf16* k_proj, const bf16* v_proj,
+                    const int* slots, const int* positions, int num_rows, int layer);
 
 void topKSample(const bf16* logits, int* sampled_tokens, const float* uniform_rand,
                 int num_rows, int k, float temperature);

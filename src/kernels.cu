@@ -367,10 +367,11 @@ void rope(bf16* input, int num_tokens, int proj_dim) {
 
 }
 
-__global__ void decodeSoftmaxKernel(bf16* attention_scores, int seq_len) {
+__global__ void decodeSoftmaxKernel(bf16* attention_scores, const int* positions) {
   __shared__ float m[MAX_NUM_THREAD];
   __shared__ float d[MAX_NUM_THREAD];
 
+  int seq_len = positions[blockIdx.x / NUM_Q_HEADS] + 1;
   int workIdx = blockIdx.x * MAX_SEQ_LEN + threadIdx.x;
   float token = -INF;
   if(threadIdx.x < seq_len) token = (float)attention_scores[workIdx];
@@ -401,15 +402,40 @@ __global__ void decodeSoftmaxKernel(bf16* attention_scores, int seq_len) {
   }
 }
 
-void decodeSoftmax(bf16* attention_scores, int seq_len) {
-  if (seq_len > MAX_NUM_THREAD) {
-    std::cerr << "decodeSoftmax: seq_len " << seq_len << " exceeds " << MAX_NUM_THREAD << "\n";
+void decodeSoftmax(bf16* attention_scores, const int* positions, int num_rows, int max_len) {
+  if(num_rows < 1) return;
+  if (max_len > MAX_NUM_THREAD) {
+    std::cerr << "decodeSoftmax: max_len " << max_len << " exceeds " << MAX_NUM_THREAD << "\n";
     return;
   }
-  decodeSoftmaxKernel<<<NUM_Q_HEADS, seq_len>>>(attention_scores, seq_len);
+  decodeSoftmaxKernel<<<num_rows*NUM_Q_HEADS, max_len>>>(attention_scores, positions);
   cudaError error = cudaGetLastError();
   if(error != cudaError::cudaSuccess) {
     std::cerr << "CUDA last error in decodeSoftmax: " << cudaGetErrorString(error) << std::endl;
+  }
+}
+
+__global__ void kvCacheScatterKernel(bf16* kv_cache, const bf16* k_proj, const bf16* v_proj,
+                                     const int* slots, const int* positions, int layer) {
+  int b = blockIdx.x;
+  int c = threadIdx.x;
+
+  bf16* slot_cache = kv_cache + (size_t)slots[b]*N_LAYERS*2*MAX_SEQ_LEN*KV_DIM;
+  bf16* dst_k = slot_cache + (size_t)2*layer*MAX_SEQ_LEN*KV_DIM + (size_t)positions[b]*KV_DIM;
+  bf16* dst_v = dst_k + (size_t)MAX_SEQ_LEN*KV_DIM;
+
+  dst_k[c] = k_proj[(size_t)b*KV_DIM + c];
+  dst_v[c] = v_proj[(size_t)b*KV_DIM + c];
+}
+
+void kvCacheScatter(bf16* kv_cache, const bf16* k_proj, const bf16* v_proj,
+                    const int* slots, const int* positions, int num_rows, int layer) {
+  if(num_rows < 1) return;
+
+  kvCacheScatterKernel<<<num_rows, KV_DIM>>>(kv_cache, k_proj, v_proj, slots, positions, layer);
+  cudaError error = cudaGetLastError();
+  if(error != cudaError::cudaSuccess) {
+    std::cerr << "CUDA last error in kvCacheScatter: " << cudaGetErrorString(error) << std::endl;
   }
 }
 

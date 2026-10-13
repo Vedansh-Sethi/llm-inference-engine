@@ -150,6 +150,7 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
   bf16* kv_cache = buf.kv_cache;
   int* gpu_input_tokens = buf.gpu_input_tokens;
   int* gpu_positions = buf.gpu_positions;
+  int* gpu_slots = buf.gpu_slots;
   bf16* hidden_state = buf.hidden_state;
   bf16* rms_norms = buf.rms_norms;
   bf16* q_proj = buf.q_proj;
@@ -175,11 +176,15 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
   int B = active.size();
   if(B == 0) return;
 
+  int max_len = 0;
+  for(int pos : batch_positions) if(pos + 1 > max_len) max_len = pos + 1;
+
   const float scale = 1.0f / SQRT_HEAD_DIM;
   const float zero = 0.0f, one = 1.0f;
 
   cudaMemcpy(gpu_input_tokens, batch_tokens.data(), B*sizeof(int), cudaMemcpyHostToDevice);
   cudaMemcpy(gpu_positions, batch_positions.data(), B*sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemcpy(gpu_slots, active.data(), B*sizeof(int), cudaMemcpyHostToDevice);
   embeddingGather(gpu_input_tokens, hidden_state, weights.embed_tokens, B);
 
   for(int layer=0; layer<N_LAYERS; layer++) {
@@ -192,14 +197,7 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
     ropeDecode(q_proj, gpu_positions, B, E_DIM);
     ropeDecode(k_proj, gpu_positions, B, KV_DIM);
 
-    for(int b=0; b<B; b++) {
-      bf16* sc = slotCache(kv_cache, active[b]);
-      size_t off = (size_t)batch_positions[b]*KV_DIM;
-      cudaMemcpy(layerK(sc, layer) + off, k_proj + (size_t)b*KV_DIM,
-      KV_DIM*sizeof(bf16), cudaMemcpyDeviceToDevice);
-      cudaMemcpy(layerV(sc, layer) + off, v_proj + (size_t)b*KV_DIM,
-      KV_DIM*sizeof(bf16), cudaMemcpyDeviceToDevice);
-    }
+    kvCacheScatter(kv_cache, k_proj, v_proj, gpu_slots, gpu_positions, B, layer);
 
     for(int b=0; b<B; b++) {
       int len = batch_positions[b] + 1;
@@ -215,8 +213,14 @@ void decode(std::vector<SlotState>& slots, const Config& cfg,
           &zero,
           Sb,                           CUDA_R_16BF, MAX_SEQ_LEN, (long long)GQA_Q_TO_K_RATIO*MAX_SEQ_LEN,
           NUM_K_HEADS, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    }
 
-      decodeSoftmax(Sb, len);
+    decodeSoftmax(attn_scores, gpu_positions, B, max_len);
+
+    for(int b=0; b<B; b++) {
+      int len = batch_positions[b] + 1;
+      bf16* Sc = slotCache(kv_cache, active[b]);
+      bf16* Sb = attn_scores + (size_t)b*NUM_Q_HEADS*MAX_SEQ_LEN;
 
       cublasGemmStridedBatchedEx(
           cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,

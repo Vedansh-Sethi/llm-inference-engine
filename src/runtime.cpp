@@ -197,11 +197,14 @@ int loadWeights(Weights &weights, fs::path model_path) {
 
 int Buffers::allocate(bool score_mode) {
   // persistent, one independent span per slot
-  cudaMalloc(&kv_cache, (size_t)MAX_SEQUENCES * N_LAYERS * 2 * MAX_SEQ_LEN * KV_DIM * sizeof(bf16));
+  size_t kv_bytes = (size_t)MAX_SEQUENCES * N_LAYERS * 2 * MAX_SEQ_LEN * KV_DIM * sizeof(bf16);
+  cudaMalloc(&kv_cache, kv_bytes);
+  cudaMemset(kv_cache, 0, kv_bytes);
 
   // residual stream scratch
   cudaMalloc(&gpu_input_tokens, (size_t)MAX_PROMPT_LEN * sizeof(int));
   cudaMalloc(&gpu_positions,    (size_t)MAX_SEQUENCES * sizeof(int));
+  cudaMalloc(&gpu_slots,        (size_t)MAX_SEQUENCES * sizeof(int));
   cudaMalloc(&hidden_state,     (size_t)MAX_PROMPT_LEN * E_DIM * sizeof(bf16));
   cudaMalloc(&rms_norms,        (size_t)MAX_PROMPT_LEN * E_DIM * sizeof(bf16));
 
@@ -240,7 +243,7 @@ int Buffers::allocate(bool score_mode) {
 
 void Buffers::free() {
   cudaFree(kv_cache);
-  cudaFree(gpu_input_tokens); cudaFree(gpu_positions);
+  cudaFree(gpu_input_tokens); cudaFree(gpu_positions); cudaFree(gpu_slots);
   cudaFree(hidden_state); cudaFree(rms_norms);
   cudaFree(q_proj); cudaFree(k_proj); cudaFree(v_proj);
   cudaFree(attn_scores); cudaFree(attn_out); cudaFree(o_proj);
