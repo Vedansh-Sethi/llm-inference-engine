@@ -7,7 +7,8 @@ namespace fs = std::filesystem;
 static void usage(const char* prog) {
   std::cerr
     << "Usage: " << prog << " <model.safetensors> <tokenizer.json> <prompts.txt> [options]\n\n"
-    << "  prompts.txt              one prompt per line, plain text. blank lines are skipped.\n"
+    << "  [prompts.txt]            required for batch/scoring, omitted for --server\n"
+    << "                           one prompt per line, plain text. blank lines are skipped.\n"
     << "                           \\n \\r \\t \\\\ are unescaped, so a prompt can span lines\n\n"
     << "  --max-new-tokens <n>     default " << MAX_NEW_TOKENS_GENERATED << "\n"
     << "  --top-k <n>              default " << DEFAULT_TOP_K << ", max " << MAX_TOP_K << "\n"
@@ -102,6 +103,8 @@ ParseResult parseArgs(int argc, char* argv[], Config& cfg) {
         cfg.greedy = true;
       } else if(arg == "--score") {
         cfg.score_mode = true;
+      } else if(arg == "--server") {
+        cfg.server_mode = true;
       } else if(arg.rfind("--", 0) == 0) {
         std::cerr << "Unknown option " << arg << "\n";
         usage(argv[0]);
@@ -117,15 +120,26 @@ ParseResult parseArgs(int argc, char* argv[], Config& cfg) {
     if(missing_value) return ParseResult::Error;
   }
 
-  if(positional.size() != 3) {
+  if(positional.size() < 2 || positional.size() > 3) {
+    std::cerr << "Error: Invalid number of positional arguments.\n";
     usage(argv[0]);
     return ParseResult::Error;
   }
+
   cfg.model_path = positional[0];
   cfg.tokenizer_path = positional[1];
-  cfg.prompts_path = positional[2];
+  
+  // Loading prompts from txt file only if prompts.txt is provided
+  if(positional.size() == 3) {
+    cfg.prompts_path = positional[2];
+    if(loadPrompts(cfg.prompts_path.value(), cfg)) return ParseResult::Error;
+  }
 
-  if(loadPrompts(cfg.prompts_path, cfg)) return ParseResult::Error;
+  // Enforce prompts file strictly for scoring mode
+  if(cfg.score_mode && positional.size() < 3) {
+    std::cerr << "Error: --score mode requires a prompts.txt file.\n";
+    return ParseResult::Error;
+  }
 
   if(cfg.greedy) cfg.top_k = 1;
 
