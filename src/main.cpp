@@ -1,6 +1,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <ostream>
 #include <queue>
 #include <tokenizers_cpp.h>
 #include <cuda_runtime.h>
@@ -113,17 +114,36 @@ void run_engine_loop (
 
       prefill(req.tokens, prompt_len, s, cfg, weights, cublas_handle, buf, slots);
       
-      if(!slots[s].active) continue;
+      if(!slots[s].active) {
+        if(req.on_token) {
+          req.on_token("\n[Error: Request dropped during prefill (likely exceeds max context length)]", true);
+        }
+        std::cerr << "[Engine] Request " << req.id << " dropped during prefill.\n";
+        continue;
+      }
 
       slots[s].id = req.id;
       slots[s].prompt_text = req.raw_text;
       slots[s].on_token_callback = req.on_token; // Store callback
 
+      // transfer time stamp from queue to the active slot
+      slots[s].arrival_time = req.arrival_time;
+
       recorder.onPrefill(s, slots[s]);
       
       std::cerr << "[Engine] Slot " << s << " prefilled " << prompt_len << " tokens\n";
-
+      
       const char* reason = finishReason(slots[s], req.max_tokens);
+
+      if(!slots[s].generated.empty() && slots[s].on_token_callback) {
+        bool is_stop = (reason != nullptr && std::string(reason) == "stop");
+        if(!is_stop) {
+          int first_token_id = slots[s].generated.back();
+          std::string token_str = tokenizer->Decode({first_token_id});
+          slots[s].on_token_callback(token_str, false);
+        }
+      }
+
       if(reason) retire_slot(s, reason);
     }
 
@@ -144,14 +164,18 @@ void run_engine_loop (
     for(int s{0}; s < MAX_SEQUENCES; s++) {
       if(!slots[s].active) continue;
 
+      const char* reason = finishReason(slots[s], cfg.max_new_tokens);
+
       // Stream last token to the request callback
       if(!slots[s].generated.empty() && slots[s].on_token_callback) {
-        int last_token_id = slots[s].generated.back();
-        std::string token_str = tokenizer->Decode({last_token_id});
-        slots[s].on_token_callback(token_str, false);
+        bool is_stop = (reason != nullptr && std::string(reason) == "stop");
+        if(!is_stop) {
+          int last_token_id = slots[s].generated.back();
+          std::string token_str = tokenizer->Decode({last_token_id});
+          slots[s].on_token_callback(token_str, false);
+        }
       }
 
-      const char* reason = finishReason(slots[s], cfg.max_new_tokens);
       if(reason) retire_slot(s, reason);
     }
   }
@@ -252,7 +276,7 @@ int main(int argc, char* argv[]) {
   }
 
   // recorder for the interactive loop
-  Recorder recorder(std::cerr);
+  Recorder recorder(cfg.server_mode ? std::cerr : *out);
 
   // Spawn prefill/decode loop thread
   std::thread engine_thread(run_engine_loop, std::ref(cfg), std::ref(model_cfg), std::ref(weights), cublas_handle, std::ref(buf), tokenizer.get(), std::ref(recorder));
@@ -283,6 +307,8 @@ int main(int argc, char* argv[]) {
         token_queue->push({token_text, is_finished});
       };
 
+      client_req.arrival_time = std::chrono::steady_clock::now();
+
       g_request_queue.push(std::move(client_req));
 
       res.set_chunked_content_provider(
@@ -308,6 +334,42 @@ int main(int argc, char* argv[]) {
 
     std::cerr << "Server listening on http://0.0.0.0:8080\n";
     server.listen("0.0.0.0", 8080);
+  } else if(!cfg.prompts.empty()) {
+    std::cerr << "Engine in batch mode. Processing " << cfg.prompts.size() << " prompts\n";
+
+    std::atomic<int> completed_requests{0};
+    int total_requests = static_cast<int>(cfg.prompts.size());
+
+    for(size_t i{0}; i<cfg.prompts.size(); i++) {
+      ClientRequest req;
+      req.id = std::to_string(i);
+      req.raw_text = cfg.prompts[i];
+      req.tokens = tokenizer->Encode(req.raw_text);
+
+      if(req.tokens.empty() || req.tokens[0] != model_cfg.bos_token_id) {
+        req.tokens.insert(req.tokens.begin(), model_cfg.bos_token_id);
+      }
+
+      req.max_tokens = cfg.max_new_tokens;
+      req.on_token = [&completed_requests, out](const std::string& token_text, bool is_finished) {
+        if(!is_finished) {
+          *out << token_text << std::flush;
+        } else {
+          *out << "\n" << std::flush;
+          completed_requests++;
+        }
+      };
+
+      req.arrival_time = std::chrono::steady_clock::now();
+
+      g_request_queue.push(std::move(req));
+    }
+
+    while(completed_requests < total_requests) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    recorder.writeRun(cfg, total_requests);
   } else {
 
     std::cerr << "Engine started in terminal mode.\n Type a prompt and press Enter (or 'exit' to quit):\n";
@@ -339,6 +401,8 @@ int main(int argc, char* argv[]) {
         }
       };
       
+      req.arrival_time = std::chrono::steady_clock::now();
+
       g_request_queue.push(std::move(req));
     }
     

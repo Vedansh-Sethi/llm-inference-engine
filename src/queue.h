@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <chrono>
 
 struct ClientRequest {
     std::string id;
@@ -18,6 +19,8 @@ struct ClientRequest {
 
     // Callback to stream tokens back to the request handler thread
     std::function<void(const std::string& token_text, bool is_finished)> on_token;
+    
+    std::chrono::steady_clock::time_point arrival_time;
 };
 
 class RequestQueue {

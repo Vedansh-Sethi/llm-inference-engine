@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cublas_v2.h>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@ struct SlotState {
   std::string id;
   std::string prompt_text;
   std::function<void(const std::string& token_text, bool is_finished)> on_token_callback;
+  std::chrono::steady_clock::time_point arrival_time;
 };
 
 bool isStopToken(int token);

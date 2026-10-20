@@ -15,8 +15,11 @@ void Recorder::onPrefill(int slot, const SlotState& slot_state) {
   cudaDeviceSynchronize();
   double now = nowMs();
 
+  auto current_time = std::chrono::steady_clock::now();
+  double wait_time_ms = std::chrono::duration<double, std::milli>(current_time - slot_state.arrival_time).count();
+
   SlotTiming& t = timing[slot];
-  t.arrival_ms = 0.0;
+  t.arrival_ms = now - wait_time_ms;
   t.ttft_ms = now;
   t.token_times_ms.clear();
   if(!slot_state.generated.empty()) t.token_times_ms.push_back(now);
