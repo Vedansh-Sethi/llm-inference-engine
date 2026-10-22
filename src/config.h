@@ -2,12 +2,13 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <optional>
 #include "kernels.cuh"
 
 struct Config {
   std::filesystem::path model_path;
   std::filesystem::path tokenizer_path;
-  std::filesystem::path prompts_path;
+  std::optional<std::filesystem::path> prompts_path;
 
   std::vector<std::string> prompts;
 
@@ -20,6 +21,7 @@ struct Config {
   bool seeded = false;
 
   bool score_mode = false;
+  bool server_mode = false;
   std::filesystem::path output_path;
 };
 
