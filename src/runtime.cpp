@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include <nlohmann/json.hpp>
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <fstream>
 #include <iostream>
@@ -15,7 +16,7 @@ int checkGPUStatus() {
   cudaGetDeviceCount(&device_count);
 
   if(device_count==0) {
-    std::cerr << "No GPU devices found\n";
+    std::cerr << "No CUDA devices found\n";
     return 1;
   }
 

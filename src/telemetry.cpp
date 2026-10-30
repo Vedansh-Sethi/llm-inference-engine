@@ -1,5 +1,6 @@
 #include "telemetry.h"
 #include <nlohmann/json.hpp>
+#include <cuda_runtime.h>
 
 using json = nlohmann::json;
 
